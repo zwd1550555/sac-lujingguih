@@ -1,0 +1,159 @@
+# 高级智能体训练配置文件
+# 集成四支柱优化技术：因果推理、网络效能、训练策略、模型鲁棒性
+
+# 训练参数
+train:
+  max_episodes: 3000          # 最大训练轮数
+  max_steps: 2000            # 每轮最大步数
+  batch_size: 512            # 批次大小
+  warmup_steps: 15000        # 预热步数
+  update_interval: 1         # 更新间隔
+  sequence_length: 15        # 序列长度
+  num_obstacles: 3           # 障碍物数量
+  replay_buffer_capacity: 2000000  # 经验回放缓冲区容量
+  
+  # 学习率调度
+  gamma: 0.99                # 折扣因子
+  tau: 0.005                 # 软更新系数
+  alpha: 0.2                 # 熵系数
+
+# 网络结构
+network:
+  hidden_dim: 512            # 隐藏层维度
+  num_layers: 4              # 网络层数
+  dropout_rate: 0.1          # Dropout率
+  activation: 'relu'         # 激活函数
+
+# 优化器配置
+optimizer:
+  actor_lr: 1e-4             # Actor学习率
+  critic_lr: 1e-4            # Critic学习率
+  world_model_lr: 1e-3       # 世界模型学习率
+  weight_decay: 1e-5         # 权重衰减
+  gradient_clip_norm: 1.0    # 梯度裁剪
+
+# 奖励配置
+reward:
+  # 基础奖励
+  reach_goal_bonus: 1000.0   # 到达目标奖励
+  collision_penalty: -1000.0 # 碰撞惩罚
+  timeout_penalty: -100.0    # 超时惩罚
+  
+  # 安全奖励
+  safety_distance: 20.0      # 安全距离
+  safety_penalty_weight: 2.0 # 安全距离惩罚权重
+  
+  # 因果奖励
+  causal_credit_bonus: 5.0   # 因果信誉奖励
+  
+  # 高级奖励权重
+  comfort_weight: 0.2        # 舒适性权重
+  efficiency_weight: 0.15    # 能效权重
+  safety_weight: 0.4         # 安全性权重
+  goal_weight: 0.25          # 目标权重
+  
+  # 惩罚权重
+  jerk_penalty_weight: 0.1   # Jerk惩罚权重
+  energy_penalty_weight: 0.05 # 能耗惩罚权重
+
+# 因果强化学习配置
+causal:
+  enable_counterfactual: true    # 启用反事实推理
+  enable_intervention: true      # 启用干预推理
+  world_model_update_interval: 5 # 世界模型更新间隔
+  prediction_horizon: 10         # 预测时间范围
+  
+  # 决策权重
+  reward_weight: 0.7             # 奖励权重
+  safety_weight: 0.3             # 安全性权重
+  uncertainty_weight: 0.1        # 不确定性权重
+  
+  # 世界模型参数
+  world_model_lr: 1e-3           # 世界模型学习率
+  kl_weight: 0.1                 # KL散度权重
+  uncertainty_threshold: 0.5     # 不确定性阈值
+
+# 液态神经网络配置
+lnn:
+  enable_lnn: true              # 启用LNN
+  liquid_neurons: 256           # 液态神经元数量
+  time_constant: 0.1            # 时间常数
+  sequence_length: 15           # 序列长度
+  gradient_clip_norm: 1.0       # 梯度裁剪
+
+# 课程学习配置
+curriculum:
+  success_threshold: 0.75       # 成功率阈值
+  collision_threshold: 0.08     # 碰撞率阈值
+  performance_window: 100       # 性能窗口大小
+  min_episodes_per_scenario: 15 # 每个场景最小episode数
+  
+  # 场景权重
+  scenario_weights:
+    straight_path: 1.0
+    curved_path: 1.0
+    static_obstacles: 1.0
+    dynamic_obstacles: 1.0
+    intersection: 1.0
+    narrow_passage: 1.0
+    complex_scenario: 1.0
+
+# 安全约束配置
+safety:
+  max_speed: 8.0               # 最大速度 (m/s)
+  min_turn_radius: 3.0         # 最小转弯半径 (m)
+  max_acceleration: 2.0        # 最大加速度 (m/s²)
+  max_angular_velocity: 1.0    # 最大角速度 (rad/s)
+  
+  # 动作限制
+  action_limits:
+    min_action: -1.0           # 最小动作值
+    max_action: 1.0            # 最大动作值
+
+# 评估配置
+evaluation:
+  eval_interval: 100           # 评估间隔
+  eval_episodes: 10            # 评估episode数
+  save_interval: 200           # 保存间隔
+  
+  # 评估指标
+  metrics:
+    - success_rate
+    - collision_rate
+    - avg_reward
+    - avg_steps
+    - comfort_score
+    - efficiency_score
+
+# 监控配置
+monitoring:
+  log_interval: 10             # 日志间隔
+  tensorboard: true            # 启用TensorBoard
+  save_replays: false          # 保存回放
+  
+  # 性能阈值
+  performance_thresholds:
+    min_success_rate: 0.8      # 最小成功率
+    max_collision_rate: 0.05   # 最大碰撞率
+    min_avg_reward: 100.0      # 最小平均奖励
+
+# 高级特性配置
+advanced:
+  # 不确定性感知
+  uncertainty_aware: true      # 启用不确定性感知
+  exploration_bonus: 0.5       # 探索奖励
+  safety_penalty: 1.0          # 安全惩罚
+  
+  # 自适应训练
+  adaptive_training: true      # 启用自适应训练
+  lr_decay_factor: 0.95       # 学习率衰减因子
+  min_lr: 1e-6                # 最小学习率
+  
+  # 多目标优化
+  multi_objective: true        # 启用多目标优化
+  pareto_weight: 0.5          # Pareto权重
+  
+  # 元学习
+  meta_learning: false         # 启用元学习
+  meta_lr: 1e-4               # 元学习率
+  meta_update_interval: 1000   # 元更新间隔
