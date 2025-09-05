@@ -1,0 +1,76 @@
+# 因果强化学习增强的SAC训练配置文件
+# 集成液态神经网络和因果推理能力
+
+train:
+  max_episodes: 3000          # 增加训练轮数以支持更复杂的学习
+  max_steps: 2000            # 增加每轮最大步数
+  batch_size: 512            # 保持大批次大小
+  save_interval: 50          # 模型保存间隔
+  warmup_steps: 15000        # 增加预热步数
+  num_obstacles: 3           # 考虑的障碍物数量
+  sequence_length: 15        # 序列长度，用于LNNs
+
+network:
+  hidden_dim: 512            # 网络宽度
+  lnn_neurons: 256           # LNN神经元数量
+  attention_heads: 4         # 注意力头数（未来扩展）
+
+optimizer:
+  gamma: 0.99                # 折扣因子
+  tau: 0.005                 # 软更新参数
+  actor_lr: 2e-4             # 稍微降低学习率
+  critic_lr: 2e-4            # 稍微降低学习率
+  replay_size: 3000000       # 进一步增大经验池
+  target_update_interval: 1  # 目标网络更新间隔
+  lr_scheduler: "cosine"     # 学习率调度器
+  lr_step_size: 300          # 学习率衰减步长
+  lr_gamma: 0.5              # 学习率衰减因子
+
+reward:
+  # 最终状态奖励
+  reach_goal_bonus: 600.0    # 增加到达目标奖励
+  collision_penalty: -1000.0 # 进一步增加碰撞惩罚
+  timeout_penalty: -150.0    # 增加超时惩罚
+  
+  # 过程奖励
+  progress_weight: 2.5       # 增加进度奖励权重
+  speed_weight: 0.15         # 增加速度奖励权重
+  yawrate_penalty: 0.25      # 增加转向惩罚权重
+  time_penalty: 0.6          # 增加时间惩罚权重
+  
+  # 安全相关奖励
+  safety_distance: 20.0      # 安全距离（米）
+  safety_penalty_weight: 2.0 # 增加安全距离惩罚权重
+  boundary_penalty_weight: 0.8 # 增加边界惩罚权重
+  
+  # 因果奖励
+  causal_credit_bonus: 5.0   # 因果奖励权重
+  counterfactual_weight: 1.0 # 反事实奖励权重
+  intervention_bonus: 3.0    # 干预奖励权重
+
+# 因果强化学习参数
+causal:
+  enable_counterfactual: true    # 启用反事实推理
+  enable_intervention: true      # 启用干预推理
+  world_model_lr: 1e-3          # 世界模型学习率
+  world_model_hidden: 256       # 世界模型隐藏层大小
+  prediction_horizon: 5         # 预测时间范围
+  intervention_strength: 0.1    # 干预强度
+
+# 液态神经网络参数
+lnn:
+  enable_lnn: true              # 启用LNN
+  liquid_neurons: 256           # 液态神经元数量
+  time_constant: 0.1            # 时间常数
+  connectivity: 0.3             # 连接密度
+  adaptation_rate: 0.01         # 适应率
+
+# 车辆动力学参数
+dynamics:
+  max_speed: 6.0               # 增加最大速度
+  a_max: 2.5                   # 增加最大加速度
+  b_max: 3.5                   # 增加最大减速度
+  track_accel_max: 3.0         # 增加履带最大加速度
+  alpha_max: 1.2               # 增加最大转向角速度
+  omega_abs_max: 1.0           # 增加最大角速度
+  c_drag: 0.05                 # 阻力系数

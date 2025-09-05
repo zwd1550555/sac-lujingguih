@@ -74,14 +74,22 @@ class Actor(nn.Module):
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
 
+        # 增加网络深度，提高表达能力
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.mean_layer = nn.Linear(hidden_dim, action_dim)
-        self.log_std_layer = nn.Linear(hidden_dim, action_dim)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)  # 新增层
+        self.mean_layer = nn.Linear(hidden_dim // 2, action_dim)
+        self.log_std_layer = nn.Linear(hidden_dim // 2, action_dim)
+        
+        # 添加dropout防止过拟合
+        self.dropout = nn.Dropout(0.1)
 
     def forward(self, state: torch.Tensor):
         x = F.relu(self.fc1(state))
+        x = self.dropout(x)
         x = F.relu(self.fc2(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc3(x))
         mean = self.mean_layer(x)
         log_std = torch.clamp(self.log_std_layer(x), self.log_std_min, self.log_std_max)
         return mean, log_std
@@ -90,24 +98,40 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int):
         super().__init__()
-        # Q1
+        # Q1 - 增加网络深度
         self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
-        # Q2
-        self.fc4 = nn.Linear(state_dim + action_dim, hidden_dim)
-        self.fc5 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc6 = nn.Linear(hidden_dim, 1)
+        self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.fc4 = nn.Linear(hidden_dim // 2, 1)
+        
+        # Q2 - 增加网络深度
+        self.fc5 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.fc6 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc7 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.fc8 = nn.Linear(hidden_dim // 2, 1)
+        
+        # 添加dropout防止过拟合
+        self.dropout = nn.Dropout(0.1)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor):
         sa = torch.cat([state, action], dim=1)
+        
+        # Q1
         q1 = F.relu(self.fc1(sa))
+        q1 = self.dropout(q1)
         q1 = F.relu(self.fc2(q1))
-        q1 = self.fc3(q1)
+        q1 = self.dropout(q1)
+        q1 = F.relu(self.fc3(q1))
+        q1 = self.fc4(q1)
 
-        q2 = F.relu(self.fc4(sa))
-        q2 = F.relu(self.fc5(q2))
-        q2 = self.fc6(q2)
+        # Q2
+        q2 = F.relu(self.fc5(sa))
+        q2 = self.dropout(q2)
+        q2 = F.relu(self.fc6(q2))
+        q2 = self.dropout(q2)
+        q2 = F.relu(self.fc7(q2))
+        q2 = self.fc8(q2)
+        
         return q1, q2
 
 
