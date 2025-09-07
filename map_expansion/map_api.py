@@ -16,7 +16,7 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from matplotlib.colors import to_rgba
 from shapely import affinity
-from shapely.geometry import Polygon,LineString,Point,box
+from shapely.geometry import Polygon,LineString,Point,box,MultiPolygon
 
 # # 添加必要的路径到sys.path
 def add_path_to_sys(target:str):
@@ -837,17 +837,46 @@ class TgScenesMapExplorer:
             for record in records:  # 一个token一个的画图
                 polygon = self.map_api.extract_polygon(record['link_polygon_token'])  # 创建一个 Shapely 多边形对象
 
-                if first_time:
-                    label = layer_name
-                    first_time = False
-                else:
-                    label = None
-                base_color = to_rgba(self.color_map[layer_name]) # Convert the hex to RGBA
-                edge_color_with_alpha = (base_color[0],base_color[1],base_color[2],1)  # Set edge alpha to 1
-                face_color_with_alpha = (base_color[0],base_color[1],base_color[2],0.1)  # Set face alpha to 0.1
-                
-                ax.add_patch(descartes.PolygonPatch(polygon,fc=face_color_with_alpha,ec=edge_color_with_alpha,label=label))
-                # ax.add_patch(descartes.PolygonPatch(polygon,fc=self.color_map[layer_name],alpha=alpha,label=label) #!之前的代码
+                # 处理无效/空/多多边形几何，避免 Descartes 出错
+                try:
+                    if polygon is None:
+                        continue
+                    # 修复无效多边形（自交等），并跳过空几何
+                    if not polygon.is_valid:
+                        polygon = polygon.buffer(0)
+                    if polygon.is_empty:
+                        continue
+
+                    geometries = [polygon] if isinstance(polygon, Polygon) else (
+                        list(polygon.geoms) if isinstance(polygon, MultiPolygon) else []
+                    )
+                    if not geometries:
+                        continue
+
+                    for geom in geometries:
+                        if geom is None or geom.is_empty:
+                            continue
+                        base_color = to_rgba(self.color_map[layer_name]) # Convert the hex to RGBA
+                        edge_color_with_alpha = (base_color[0],base_color[1],base_color[2],1)  # Set edge alpha to 1
+                        face_color_with_alpha = (base_color[0],base_color[1],base_color[2],0.1)  # Set face alpha to 0.1
+
+                        if first_time:
+                            label = layer_name
+                            first_time = False
+                        else:
+                            label = None
+
+                        ax.add_patch(
+                            descartes.PolygonPatch(
+                                geom,
+                                fc=face_color_with_alpha,
+                                ec=edge_color_with_alpha,
+                                label=label,
+                            )
+                        )
+                except Exception:
+                    # 出现无法渲染的几何时跳过，保证整体可视化不中断
+                    continue
                 
                 
     def _render_road_block_polygon_layer(self,ax:Axes,layer_name:str,alpha:float,tokens:List[str] = None) -> None:
@@ -867,16 +896,42 @@ class TgScenesMapExplorer:
                            for token in link_nodeblock_tokens] #组成 road_block 多边形的角点
                 polygon =  Polygon(link_coords)# 创建一个 Shapely 多边形对象
 
-                if first_time:
-                    label = layer_name
-                    first_time = False
-                else:
-                    label = None
-                base_color = to_rgba(self.color_map[layer_name]) # Convert the hex to RGBA
-                edge_color_with_alpha = (base_color[0],base_color[1],base_color[2],1)  # Set edge alpha to 1
-                face_color_with_alpha = (base_color[0],base_color[1],base_color[2],0.5)  # Set face alpha to 0.1
-                
-                ax.add_patch(descartes.PolygonPatch(polygon,fc=face_color_with_alpha,ec=edge_color_with_alpha,label=label))            
+                try:
+                    if polygon is None:
+                        continue
+                    if not polygon.is_valid:
+                        polygon = polygon.buffer(0)
+                    if polygon.is_empty:
+                        continue
+
+                    geometries = [polygon] if isinstance(polygon, Polygon) else (
+                        list(polygon.geoms) if isinstance(polygon, MultiPolygon) else []
+                    )
+                    if not geometries:
+                        continue
+
+                    base_color = to_rgba(self.color_map[layer_name]) # Convert the hex to RGBA
+                    edge_color_with_alpha = (base_color[0],base_color[1],base_color[2],1)  # Set edge alpha to 1
+                    face_color_with_alpha = (base_color[0],base_color[1],base_color[2],0.5)  # Set face alpha to 0.5
+
+                    for geom in geometries:
+                        if geom is None or geom.is_empty:
+                            continue
+                        if first_time:
+                            label = layer_name
+                            first_time = False
+                        else:
+                            label = None
+                        ax.add_patch(
+                            descartes.PolygonPatch(
+                                geom,
+                                fc=face_color_with_alpha,
+                                ec=edge_color_with_alpha,
+                                label=label,
+                            )
+                        )
+                except Exception:
+                    continue            
    
                 
     def render_base_path_centerlines(self,

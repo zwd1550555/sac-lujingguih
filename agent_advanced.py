@@ -1,19 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-高级智能体实现 - 集成因果推理和主动决策
-实现基于干预预测的主动决策系统
+高级智能体实现 - 集成因果推理、主动决策和MCTS规划
+实现基于干预预测的主动决策系统和深思熟虑的规划能力
 
 主要特性:
 - 基于干预预测的主动决策: 在决策前利用因果模型进行长期规划
 - 候选动作评估: 生成多个候选动作并评估其长期效果
 - 综合评分系统: 结合奖励、安全性和不确定性的综合评分
 - 长期规划能力: 具备"牺牲眼前利益换取长远优势"的决策能力
+- MCTS规划: 基于世界模型的蒙特卡洛树搜索，实现深思熟虑的决策
 
 技术优势:
 - 从短视决策到长期规划
 - 从被动反应到主动预测
 - 从单一评估到多维综合评估
 - 从确定性决策到考虑不确定性的鲁棒决策
+- 从"反应式"到"深思式"的决策能力
 """
 
 import torch
@@ -23,6 +25,7 @@ import numpy as np
 from typing import List, Tuple, Dict, Optional
 from agent_lnn import LiquidSACAgent, LiquidActor, LiquidCritic, SequenceReplayBuffer
 from world_model import WorldModel, CausalReasoner
+from mcts_planner import MCTS_Planner, MCTS_Config
 
 
 class AdvancedLiquidActor(LiquidActor):
@@ -199,7 +202,7 @@ class InterventionBasedDecisionMaker:
 
 class AdvancedLiquidSACAgent(LiquidSACAgent):
     """
-    高级液态神经网络SAC智能体 - 集成因果推理和主动决策
+    高级液态神经网络SAC智能体 - 集成因果推理、主动决策和MCTS规划
     """
     
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256,
@@ -207,7 +210,9 @@ class AdvancedLiquidSACAgent(LiquidSACAgent):
                  critic_lr: float = 3e-4, gamma: float = 0.99, tau: float = 0.005,
                  alpha: float = 0.2, target_update_interval: int = 1,
                  sequence_length: int = 10, num_candidates: int = 5,
-                 use_intervention_decision: bool = True):
+                 use_intervention_decision: bool = True,
+                 use_mcts_planning: bool = False,
+                 mcts_config: Optional[MCTS_Config] = None):
         
         # 初始化父类
         super().__init__(state_dim, action_dim, hidden_dim, replay_buffer_capacity,
@@ -223,8 +228,13 @@ class AdvancedLiquidSACAgent(LiquidSACAgent):
         
         # 决策相关参数
         self.use_intervention_decision = use_intervention_decision
+        self.use_mcts_planning = use_mcts_planning
         self.num_candidates = num_candidates
         self.decision_maker = None  # 将在外部设置
+        self.mcts_planner = None  # MCTS规划器
+        
+        # MCTS配置
+        self.mcts_config = mcts_config if mcts_config is not None else MCTS_Config()
         
     def set_decision_maker(self, decision_maker: InterventionBasedDecisionMaker):
         """
@@ -235,10 +245,48 @@ class AdvancedLiquidSACAgent(LiquidSACAgent):
         """
         self.decision_maker = decision_maker
     
+    def set_mcts_planner(self, world_model, critic):
+        """
+        设置MCTS规划器
+        
+        Args:
+            world_model: 世界模型
+            critic: Critic网络
+        """
+        if self.use_mcts_planning:
+            self.mcts_planner = MCTS_Planner(
+                world_model=world_model,
+                actor=self.actor,
+                critic=critic,
+                device=self.device,
+                num_simulations=self.mcts_config.num_simulations,
+                exploration_constant=self.mcts_config.exploration_constant,
+                gamma=self.mcts_config.gamma,
+                max_depth=self.mcts_config.max_depth,
+                temperature=self.mcts_config.temperature
+            )
+            print("MCTS Planner has been initialized.")
+    
+    def set_mcts_config(self, mcts_config: MCTS_Config):
+        """
+        设置MCTS配置
+        
+        Args:
+            mcts_config: MCTS配置
+        """
+        self.mcts_config = mcts_config
+        if self.mcts_planner is not None:
+            # 更新现有规划器的配置
+            self.mcts_planner.num_simulations = mcts_config.num_simulations
+            self.mcts_planner.exploration_constant = mcts_config.exploration_constant
+            self.mcts_planner.gamma = mcts_config.gamma
+            self.mcts_planner.max_depth = mcts_config.max_depth
+            self.mcts_planner.temperature = mcts_config.temperature
+    
     @torch.no_grad()
     def select_action(self, state: np.ndarray, hidden_state=None, evaluate: bool = False) -> Tuple[np.ndarray, any]:
         """
-        选择动作 - 支持基于干预预测的主动决策
+        选择动作 - 支持MCTS规划、基于干预预测的主动决策和标准决策
         
         Args:
             state: 当前状态
@@ -251,20 +299,35 @@ class AdvancedLiquidSACAgent(LiquidSACAgent):
         """
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
         
-        if not self.use_intervention_decision or evaluate or self.decision_maker is None:
-            # 使用标准决策
-            return super().select_action(state, hidden_state, evaluate)
+        # --- MCTS规划分支 ---
+        if self.use_mcts_planning and not evaluate and self.mcts_planner is not None:
+            # 1. 运行MCTS搜索来获得深思熟虑后的最佳动作
+            best_action = self.mcts_planner.search(initial_state=state, initial_hidden_state=hidden_state)
+            
+            # 2. MCTS规划本身不更新LNN的隐藏状态。
+            # 为了保持隐藏状态的连续性，我们仍然需要通过LNN正向传播一次来获得新的隐藏状态。
+            # 这是一个工程上的权衡，确保了时序记忆的连贯性。
+            _, _, new_hidden_state = self.actor(state_t, hidden_state)
+            
+            return best_action, new_hidden_state
         
-        # 使用基于干预预测的主动决策
-        candidate_actions, candidate_log_probs, new_hidden_state = self.actor.generate_candidate_actions(state_t, hidden_state)
+        # --- 基于干预预测的主动决策分支 ---
+        if self.use_intervention_decision and not evaluate and self.decision_maker is not None:
+            # 使用基于干预预测的主动决策
+            candidate_actions, candidate_log_probs, new_hidden_state = self.actor.generate_candidate_actions(state_t, hidden_state)
+            
+            # 评估候选动作
+            evaluation_results = self.decision_maker.evaluate_candidate_actions(state_t, candidate_actions)
+            
+            # 选择最佳动作
+            best_action, best_index = self.decision_maker.select_best_action(candidate_actions, evaluation_results)
+            
+            return best_action.squeeze(0).cpu().numpy(), new_hidden_state
         
-        # 评估候选动作
-        evaluation_results = self.decision_maker.evaluate_candidate_actions(state_t, candidate_actions)
-        
-        # 选择最佳动作
-        best_action, best_index = self.decision_maker.select_best_action(candidate_actions, evaluation_results)
-        
-        return best_action.squeeze(0).cpu().numpy(), new_hidden_state
+        # --- 默认的标准SAC决策 ---
+        # 调用父类的标准select_action
+        action_np, new_hidden_state = super().select_action(state, hidden_state, evaluate)
+        return action_np, new_hidden_state
     
     def get_decision_info(self, state: np.ndarray, hidden_state=None) -> Dict:
         """
@@ -277,18 +340,48 @@ class AdvancedLiquidSACAgent(LiquidSACAgent):
         Returns:
             decision_info: 决策信息字典
         """
-        if not self.use_intervention_decision or self.decision_maker is None:
-            return {}
-        
-        state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
-        candidate_actions, _, _ = self.actor.generate_candidate_actions(state_t, hidden_state)
-        evaluation_results = self.decision_maker.evaluate_candidate_actions(state_t, candidate_actions)
-        
-        return {
-            'candidate_actions': candidate_actions.cpu().numpy(),
-            'evaluation_results': {k: v.cpu().numpy() for k, v in evaluation_results.items()},
-            'num_candidates': self.num_candidates
+        decision_info = {
+            'decision_mode': 'standard',
+            'use_mcts_planning': self.use_mcts_planning,
+            'use_intervention_decision': self.use_intervention_decision
         }
+        
+        # MCTS规划信息
+        if self.use_mcts_planning and self.mcts_planner is not None:
+            decision_info['decision_mode'] = 'mcts_planning'
+            decision_info['mcts_stats'] = self.mcts_planner.get_search_statistics()
+            decision_info['mcts_config'] = self.mcts_config.to_dict()
+        
+        # 干预预测决策信息
+        elif self.use_intervention_decision and self.decision_maker is not None:
+            decision_info['decision_mode'] = 'intervention_decision'
+            state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+            candidate_actions, _, _ = self.actor.generate_candidate_actions(state_t, hidden_state)
+            evaluation_results = self.decision_maker.evaluate_candidate_actions(state_t, candidate_actions)
+            
+            decision_info.update({
+                'candidate_actions': candidate_actions.cpu().numpy(),
+                'evaluation_results': {k: v.cpu().numpy() for k, v in evaluation_results.items()},
+                'num_candidates': self.num_candidates
+            })
+        
+        return decision_info
+    
+    def get_mcts_statistics(self) -> Dict:
+        """
+        获取MCTS统计信息
+        
+        Returns:
+            Dict: MCTS统计信息
+        """
+        if self.mcts_planner is not None:
+            return self.mcts_planner.get_search_statistics()
+        return {}
+    
+    def reset_mcts_statistics(self):
+        """重置MCTS统计信息"""
+        if self.mcts_planner is not None:
+            self.mcts_planner.reset_statistics()
 
 
 class ProbabilisticWorldModel(WorldModel):

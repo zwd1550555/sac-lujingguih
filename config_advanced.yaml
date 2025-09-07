@@ -81,6 +81,22 @@ lnn:
   sequence_length: 15           # 序列长度
   gradient_clip_norm: 1.0       # 梯度裁剪
 
+# MCTS规划配置
+mcts:
+  enable_mcts: false            # 启用MCTS规划
+  num_simulations: 100          # 模拟次数
+  exploration_constant: 1.5     # 探索常数
+  gamma: 0.99                   # 折扣因子
+  max_depth: 20                 # 最大搜索深度
+  temperature: 1.0              # 动作选择温度
+  
+  # 高级MCTS特性
+  enable_uncertainty_aware: true # 启用不确定性感知
+  uncertainty_threshold: 0.5    # 不确定性阈值
+  adaptive_simulations: true    # 自适应模拟次数
+  min_simulations: 50           # 最小模拟次数
+  max_simulations: 200          # 最大模拟次数
+
 # 课程学习配置
 curriculum:
   success_threshold: 0.75       # 成功率阈值

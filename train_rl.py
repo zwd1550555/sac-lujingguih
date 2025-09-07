@@ -43,10 +43,11 @@ def extract_state(observation: dict, collision_lookup: CollisionLookup, num_obst
     """
     提取智能体状态，包含车辆状态、目标信息、障碍物信息和边界感知信息
     
-    状态向量构成 (总共22维):
+    状态向量构成:
     - 车辆状态 (5维): 速度、角速度、目标距离、目标相对位置
     - 障碍物信息 (12维): 最近3个障碍物的相对位置和相对速度 (4维×3个)
     - 边界感知 (5维): 前方、左前、右前、左侧、右侧方向的边界距离
+    - 坡度与高程 (2维): 最近参考路径点的高程(米)与坡度(度)的归一化值
     
     Args:
         observation (dict): 环境观察数据，包含车辆信息、目标信息、地图信息等
@@ -131,6 +132,49 @@ def extract_state(observation: dict, collision_lookup: CollisionLookup, num_obst
         # 如果没有地图信息，提供默认值
         state.extend([1.0] * 5)  # 5个方向的边界感知
 
+    # --- 坡度/高程信息 ---
+    # 说明：HD Map 的 reference_path.waypoints 中，单个路径点为 5 维数组 [x, y, yaw, height, slope]
+    #       - height: 路面高程/海拔，单位米（相对本地地图坐标的高程基准）
+    #       - slope: 路面坡度，单位度（°），>0 上坡，<0 下坡
+    # 设计：
+    #   1) 我们取“距离自车最近的参考路径点”的 height/slope 作为局部地形特征；
+    #   2) 归一化：height/1000（默认高程量级在百米），slope/15（常见坡度在±15°内），并裁剪至[-1,1]；
+    #   3) 通过 test_setting.train_cfg.enable_slope_features 开关控制是否启用该特征；
+    #   4) 如需进一步增强，可加入前方若干米的坡度统计（mean/max/min），此处保留最小实现。
+    try:
+        tgsc_map = observation.get('hdmaps_info', {}).get('tgsc_map')
+        enable_slope = observation.get('test_setting', {}).get('train_cfg', {}).get('enable_slope_features', True)
+        if tgsc_map is not None and enable_slope:
+            ego_x = float(ego['x'])
+            ego_y = float(ego['y'])
+            # 在所有参考路径中近邻检索一个最近点（步长抽样提速）
+            nearest_height = 0.0
+            nearest_slope_deg = 0.0
+            min_dist2 = 1e18
+            # reference_path 为列表，每个 path 有 waypoints: [x,y,yaw,height,slope]
+            for ref in tgsc_map.reference_path:
+                waypoints = ref.get('waypoints', [])
+                if not waypoints:
+                    continue
+                # 步长抽样，提升性能
+                for wp in waypoints[::5]:
+                    dx = float(wp[0]) - ego_x
+                    dy = float(wp[1]) - ego_y
+                    d2 = dx*dx + dy*dy
+                    if d2 < min_dist2:
+                        min_dist2 = d2
+                        # 索引3/4 分别是 height(米), slope(度)
+                        nearest_height = float(wp[3]) if len(wp) > 3 else 0.0
+                        nearest_slope_deg = float(wp[4]) if len(wp) > 4 else 0.0
+            # 归一化：高程/1000，坡度/15 度
+            height_norm = nearest_height / 1000.0
+            slope_norm = max(-1.0, min(1.0, nearest_slope_deg / 15.0))
+            state.extend([height_norm, slope_norm])
+        else:
+            state.extend([0.0, 0.0])
+    except Exception:
+        state.extend([0.0, 0.0])
+
     return np.array(state, dtype=np.float32)
 
 
@@ -184,6 +228,45 @@ def calculate_reward(curr_obs: dict, prev_obs: dict, reward_cfg: dict) -> float:
     r += float(ego['v_mps']) * speed_weight
     r -= abs(float(ego['yawrate_radps'])) * yawrate_penalty
     r -= time_penalty
+
+    # 2.1 坡度相关奖励/惩罚（能耗/安全/稳定性）
+    # 说明：
+    #   - 上坡能耗：坡度越大、速度越高，能耗越大 → 惩罚项与 slope_rad 和 v 成正相关；
+    #   - 下坡超速：下坡时设定“安全速度” v_safe（坡度越陡安全速度越低），超过则惩罚；
+    #   - 坡面稳定性：坡大时更鼓励平稳，惩罚 |yawrate|*(1+|slope|)。
+    try:
+        tgsc_map = curr_obs.get('hdmaps_info', {}).get('tgsc_map')
+        slope_uphill_weight = float(reward_cfg.get('slope_uphill_weight', 0.05))
+        slope_downhill_weight = float(reward_cfg.get('slope_downhill_weight', 0.08))
+        slope_smooth_weight = float(reward_cfg.get('slope_smooth_weight', 0.02))
+        if tgsc_map is not None:
+            ego_x = float(ego['x']); ego_y = float(ego['y'])
+            # 近邻坡度
+            nearest_slope_deg = 0.0
+            min_d2 = 1e18
+            for ref in tgsc_map.reference_path:
+                wps = ref.get('waypoints', [])
+                for wp in wps[::5]:
+                    dx = float(wp[0]) - ego_x
+                    dy = float(wp[1]) - ego_y
+                    d2 = dx*dx + dy*dy
+                    if d2 < min_d2:
+                        min_d2 = d2
+                        nearest_slope_deg = float(wp[4]) if len(wp) > 4 else 0.0
+            slope_rad = nearest_slope_deg * math.pi / 180.0
+            v_now = float(ego['v_mps'])
+            yawrate_now = float(ego['yawrate_radps'])
+            # 上坡能耗惩罚（坡度越大越“吃力”）
+            r -= slope_uphill_weight * max(0.0, slope_rad) * v_now
+            # 下坡超速惩罚：超过下坡安全速度给予惩罚
+            vmax_cfg = curr_obs.get('test_setting', {}).get('dynamics_params', {}).get('max_speed', 5.0)
+            v_safe = float(vmax_cfg) * (1.0 - min(0.5, abs(nearest_slope_deg) / 15.0))
+            if nearest_slope_deg < 0.0 and v_now > v_safe:
+                r -= slope_downhill_weight * (v_now - v_safe)
+            # 坡面稳定性：坡度越大越鼓励平稳（惩罚转向与坡度的联合作用）
+            r -= slope_smooth_weight * abs(yawrate_now) * (1.0 + abs(slope_rad))
+    except Exception:
+        pass
     
     # 3. 主动避障与安全距离惩罚
     min_dist_to_obs = float('inf')
@@ -281,6 +364,10 @@ def apply_safety_constraints(action: np.ndarray, env, observation: dict) -> np.n
         a_max = float(dynamics_params.get('a_max', 2.0))
         b_max = float(dynamics_params.get('b_max', 3.0))
         omega_max = float(dynamics_params.get('omega_abs_max', 0.8))
+        # 训练配置中下坡限速因子
+        # 说明：下坡时将最大安全线速度 vmax 按比例缩放，避免溜车/过快导致失稳。
+        train_cfg = observation.get('test_setting', {}).get('train_cfg', {})
+        downhill_factor = float(train_cfg.get('max_speed_downhill_factor', 0.7))
         
         v_l, v_r = float(action[0]), float(action[1])
         
@@ -309,16 +396,46 @@ def apply_safety_constraints(action: np.ndarray, env, observation: dict) -> np.n
                     v_l = mid - half * np.sign(diff)
                     v_r = mid + half * np.sign(diff)
         
-        # 3. 加速度限制（基于前一步速度）
+        # 计算邻近坡度
+        # 说明：在全部 reference_path 中以步长抽样寻找最近 waypoint，读取 slope 角度并转弧度。
+        tgsc_map = observation.get('hdmaps_info', {}).get('tgsc_map')
+        slope_rad = 0.0
+        if tgsc_map is not None:
+            ego_x = float(ego['x']); ego_y = float(ego['y'])
+            min_d2 = 1e18
+            for ref in tgsc_map.reference_path:
+                wps = ref.get('waypoints', [])
+                for wp in wps[::5]:
+                    dx = float(wp[0]) - ego_x
+                    dy = float(wp[1]) - ego_y
+                    d2 = dx*dx + dy*dy
+                    if d2 < min_d2:
+                        min_d2 = d2
+                        if len(wp) > 4:
+                            slope_rad = float(wp[4]) * math.pi / 180.0
+
+        # 3. 加速度限制（考虑坡度的等效加减速度）
+        # 说明：上坡会“吃掉”一部分可用驱动力（a_eff_max = a_max - g*sin(slope+)），
+        #       下坡需要预留更强的制动（b_eff_max = b_max + g*sin(-slope)）。
         dt = 0.1  # 假设时间步长
-        max_accel = a_max * dt / vmax
-        max_decel = b_max * dt / vmax
+        g = 9.81
+        a_eff_max = max(0.2, a_max - g * max(0.0, math.sin(slope_rad)))
+        b_eff_max = b_max + g * max(0.0, -math.sin(slope_rad))
+        max_accel = a_eff_max * dt / max(1e-6, vmax)
+        max_decel = b_eff_max * dt / max(1e-6, vmax)
         
         # 限制加速度变化
         v_l = np.clip(v_l, ego_v/vmax - max_decel, ego_v/vmax + max_accel)
         v_r = np.clip(v_r, ego_v/vmax - max_decel, ego_v/vmax + max_accel)
         
-        # 4. 角速度限制
+        # 4. 下坡限速与角速度限制
+        # 说明：
+        #   - 下坡：将 vmax_eff = vmax * downhill_factor（下限0.3，避免极端0导致停滞）；
+        #   - 角速度：按车辆几何和 vmax 约束 (与差速相关)。
+        if slope_rad < 0.0:
+            vmax_eff = vmax * max(0.3, min(1.0, downhill_factor))
+        else:
+            vmax_eff = vmax
         current_omega = (v_r - v_l) * vmax / width
         if abs(current_omega) > omega_max:
             scale = omega_max / (abs(current_omega) + 1e-6)
@@ -330,6 +447,12 @@ def apply_safety_constraints(action: np.ndarray, env, observation: dict) -> np.n
         # 5. 最终范围限制
         v_l = np.clip(v_l, -1.0, 1.0)
         v_r = np.clip(v_r, -1.0, 1.0)
+
+        # 将速度按下坡限速进行二次压缩（归一化域内收缩）
+        # 说明：此处 action 在 [-1,1] 域内，乘以 speed_scale 达到“限速”效果。
+        speed_scale = vmax_eff / max(1e-6, vmax)
+        v_l *= speed_scale
+        v_r *= speed_scale
         
         return np.array([v_l, v_r], dtype=np.float32)
         
@@ -379,7 +502,8 @@ def main():
     reward_cfg = cfg.get('reward', {}) if isinstance(cfg, dict) else {}
 
     NUM_OBS = int(train_cfg.get('num_obstacles', 3))
-    state_dim = 5 + 4 * NUM_OBS + 5  # 增加5维边界感知信息
+    # 状态维度：5(自车/目标) + 4*NUM_OBS(障碍物) + 5(边界感知) + 2(坡度/高程)
+    state_dim = 5 + 4 * NUM_OBS + 5 + 2
     action_dim = 2
     hidden_dim = int(net_cfg.get('hidden_dim', 256))
     gamma = float(opt_cfg.get('gamma', 0.99))
@@ -439,6 +563,13 @@ def main():
     for ep in range(max_episodes):
         scenario = random.choice(so.scenario_list)
         observation, _ = env.make(scenario, collision_lookup, read_only=True, save_img_path='')
+        # 将训练配置透传到 observation.test_setting 供状态/约束使用
+        if isinstance(cfg, dict):
+            observation['test_setting']['train_cfg'] = {
+                'enable_slope_features': bool(train_cfg.get('enable_slope_features', True)),
+                'slope_preview_meters': float(train_cfg.get('slope_preview_meters', 0.0)),
+                'max_speed_downhill_factor': float(train_cfg.get('max_speed_downhill_factor', 0.7)),
+            }
 
         prev_obs = observation
         state = extract_state(observation, collision_lookup, NUM_OBS)
@@ -452,6 +583,9 @@ def main():
                 action = agent.select_action(state)
                 action = apply_safety_constraints(action, env, observation)
             next_obs = env.step_rl(tuple(action.tolist()), collision_lookup)
+            # 透传配置以便下一步使用
+            if isinstance(cfg, dict):
+                next_obs['test_setting']['train_cfg'] = observation['test_setting']['train_cfg']
             reward = calculate_reward(next_obs, prev_obs, reward_cfg)
             done = next_obs['test_setting']['end'] != -1
             next_state = extract_state(next_obs, collision_lookup, NUM_OBS)

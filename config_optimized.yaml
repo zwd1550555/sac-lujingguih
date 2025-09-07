@@ -8,6 +8,9 @@ train:
   save_interval: 50          # 模型保存间隔
   warmup_steps: 10000        # 增加预热步数，积累更多初始经验
   num_obstacles: 3           # 考虑的障碍物数量
+  enable_slope_features: true  # 启用坡度/高程特征。true：状态中加入最近路面 height/slope 两维；false：以 [0,0] 占位
+  slope_preview_meters: 0      # 坡度预瞄距离(米)。>0 时可扩展加入前方坡度统计（本次实现保留最小版，先不启用）
+  max_speed_downhill_factor: 0.7 # 下坡最大速度缩放系数(0~1)。仅在下坡生效，越小表示限速越严格
 
 network:
   hidden_dim: 512            # 增加网络宽度，提高表达能力
@@ -34,6 +37,11 @@ reward:
   speed_weight: 0.1          # 速度奖励权重
   yawrate_penalty: 0.2       # 转向惩罚权重（增加，鼓励平滑转向）
   time_penalty: 0.5          # 时间惩罚权重
+  
+  # 坡度/高程相关奖励
+  slope_uphill_weight: 0.05     # 上坡能耗惩罚权重：r -= w * max(0, slope_rad) * v
+  slope_downhill_weight: 0.08   # 下坡超速惩罚权重：v > v_safe(slope) 时惩罚 (v - v_safe)
+  slope_smooth_weight: 0.02     # 坡面稳定性惩罚：|yawrate|*(1+|slope|)，坡越大越鼓励平稳
   
   # 安全相关奖励
   safety_distance: 15.0      # 安全距离（米）

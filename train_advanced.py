@@ -35,11 +35,12 @@ from dynamic_scenes.lookup import CollisionLookup
 from dynamic_scenes.observation import Observation
 
 # 导入高级组件
-from agent_advanced import AdvancedLiquidSACAgent, InterventionBasedDecisionMaker, ProbabilisticCausalReasoner
+from agent_advanced import AdvancedLiquidSACAgent, InterventionBasedDecisionMaker, ProbabilisticCausalReasoner, MCTS_Config
 from probabilistic_trainer import ProbabilisticWorldModelTrainer, UncertaintyAwareRewardShaping
 from sequence_trainer import SequenceBasedSACAgent, BPTTTrainer
 from curriculum_manager import CurriculumManager, ScenarioGenerator
 from advanced_reward import AdvancedRewardCalculator, RewardVisualizer
+from mcts_planner import MCTS_Planner
 
 # 导入原有组件
 from agent import SACAgent
@@ -93,7 +94,16 @@ class AdvancedTrainingManager:
         state_dim = 5 + 4 * self.config['train']['num_obstacles'] + 5  # 22维状态
         action_dim = 2
         
-        self.agent = SequenceBasedSACAgent(
+        # MCTS配置
+        mcts_config = MCTS_Config(
+            num_simulations=self.config.get('mcts', {}).get('num_simulations', 100),
+            exploration_constant=self.config.get('mcts', {}).get('exploration_constant', 1.5),
+            gamma=self.config.get('mcts', {}).get('gamma', 0.99),
+            max_depth=self.config.get('mcts', {}).get('max_depth', 20),
+            temperature=self.config.get('mcts', {}).get('temperature', 1.0)
+        )
+        
+        self.agent = AdvancedLiquidSACAgent(
             state_dim=state_dim,
             action_dim=action_dim,
             hidden_dim=self.config['network']['hidden_dim'],
@@ -104,7 +114,9 @@ class AdvancedTrainingManager:
             tau=self.config['train']['tau'],
             alpha=self.config['train']['alpha'],
             sequence_length=self.config['train']['sequence_length'],
-            use_sequence_training=True
+            use_intervention_decision=self.config.get('causal', {}).get('enable_intervention', True),
+            use_mcts_planning=self.config.get('mcts', {}).get('enable_mcts', False),
+            mcts_config=mcts_config
         )
         
         # 世界模型和因果推理器
@@ -123,6 +135,9 @@ class AdvancedTrainingManager:
         )
         
         self.agent.set_decision_maker(self.decision_maker)
+        
+        # 设置MCTS规划器
+        self.agent.set_mcts_planner(self.world_model, self.agent.critic)
         
         # 训练器
         self.world_model_trainer = ProbabilisticWorldModelTrainer(
@@ -297,9 +312,17 @@ class AdvancedTrainingManager:
                 if episode % 10 == 0:
                     self._print_progress(episode_info)
                 
-                # 记录到TensorBoard
-                if self.writer:
-                    self._log_episode_metrics(episode_info)
+                        # 记录到TensorBoard
+        if self.writer:
+            self._log_episode_metrics(episode_info)
+            
+            # 记录MCTS统计信息
+            if self.agent.use_mcts_planning:
+                mcts_stats = self.agent.get_mcts_statistics()
+                if mcts_stats:
+                    for key, value in mcts_stats.items():
+                        if isinstance(value, (int, float)):
+                            self.writer.add_scalar(f'MCTS/{key}', value, self.episode)
                 
                 # 保存模型
                 if episode % 100 == 0 and episode > 0:
