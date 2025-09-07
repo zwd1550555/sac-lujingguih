@@ -4,6 +4,286 @@ import os
 import sys
 import copy
 from itertools import combinations
+from typing import Tuple, Dict
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# 第三方库
+import json
+import numpy as np
+from shapely.geometry import Polygon
+
+# 自定义库
+import common.utils as utils
+from map_expansion.map_api import TgScenesMap
+from map_expansion.bit_map import BitMap
+from dynamic_scenes.lookup import CollisionLookup
+from dynamic_scenes.observation import Observation
+from common.config_loader import load_config_file
+
+# 【新增】车辆动力学参数类
+class VehicleDynamics:
+    """
+    封装履带车辆的物理参数，从配置文件动态加载。
+    """
+    def __init__(self, dynamics_params: dict):
+        # 车辆基本参数
+        self.mass = float(dynamics_params.get('mass_kg', 70000.0))
+        self.inertia = float(dynamics_params.get('inertia_kgm2', 120000.0))
+        self.gravity = 9.81
+        self.total_weight = self.mass * self.gravity
+
+        # 驱动系统参数
+        self.max_drive_force = float(dynamics_params.get('max_drive_force_N', 150000.0))
+
+        # 综合阻力系数
+        self.coeff_rolling = float(dynamics_params.get('coeff_rolling', 0.1))
+        self.coeff_drag = float(dynamics_params.get('coeff_drag', 1.5))
+        self.coeff_turning = float(dynamics_params.get('coeff_turning', 80000.0))
+
+        # 几何参数 (B - 两侧履带中心距)
+        self.track_width_B = float(dynamics_params.get('track_width_B_m', 4.5))
+
+
+class ReplayController():
+    def __init__(self):
+        self.control_info = None
+        self.collision_lookup = None
+        # 【新增】动力学模型实例
+        self.dynamics = None
+
+    def init(self, control_info: "ReplayInfo", collision_lookup: CollisionLookup) -> Observation:
+        self.control_info = control_info
+        self.collision_lookup = collision_lookup
+        
+        # 【新增】从配置文件中加载并初始化车辆动力学参数
+        dyn_cfg = self.control_info.test_setting.get('dynamics_params', {})
+        # 如果外部提供了覆盖路径，则尝试加载
+        dyn_path = self.control_info.test_setting.get('dynamics_params_path', '')
+        if isinstance(dyn_path, str) and dyn_path:
+            try:
+                ext_cfg = load_config_file(dyn_path) or {}
+                if isinstance(ext_cfg, dict) and 'dynamics_params' in ext_cfg:
+                    dyn_cfg.update(ext_cfg['dynamics_params'])
+            except Exception:
+                pass
+        self.dynamics = VehicleDynamics(dyn_cfg)
+        
+        return self._get_initial_observation()
+
+    def get_slope_at(self, x: float, y: float, observation: Observation) -> float:
+        """
+        【待办】根据车辆当前位置查询并返回地图上的坡度。
+        这是将地图数据与动力学模型连接的关键函数。
+
+        Args:
+            x (float): 车辆全局X坐标
+            y (float): 车辆全局Y坐标
+            observation (Observation): 当前观测值，包含地图API对象
+
+        Returns:
+            float: 坡度 (弧度 rad), 上坡为正。
+        """
+        # 暂时返回水平地面；可基于 tgsc_map.reference_path 的 height 字段做近邻拟合
+        try:
+            tgsc_map = observation.hdmaps.get('tgsc_map') if hasattr(observation, 'hdmaps') else None
+            if tgsc_map is None:
+                return 0.0
+            # 最近参考路径点的 slope (度)
+            min_d2 = 1e18
+            nearest_slope_deg = 0.0
+            for ref in tgsc_map.reference_path:
+                wps = ref.get('waypoints', [])
+                for wp in wps[::5]:
+                    dx = float(wp[0]) - x
+                    dy = float(wp[1]) - y
+                    d2 = dx*dx + dy*dy
+                    if d2 < min_d2:
+                        min_d2 = d2
+                        if len(wp) > 4:
+                            nearest_slope_deg = float(wp[4])
+            return nearest_slope_deg * math.pi / 180.0
+        except Exception:
+            return 0.0
+
+    def _update_state_dynamic(self, current_state: dict, action_tuple: tuple, dt: float, observation: Observation) -> dict:
+        """
+        【核心修改】基于动力学模型更新车辆状态。
+        """
+        v_prev = float(current_state['v_mps'])
+        omega_prev = float(current_state.get('yawrate_radps', 0.0))
+        yaw_prev = float(current_state['yaw_rad'])
+        x_prev, y_prev = float(current_state['x']), float(current_state['y'])
+
+        # 1. 动作 -> 驱动力（归一化到 [-1,1] 后映射到驱动力）
+        v_left_norm, v_right_norm = action_tuple
+        F_drive_left = float(np.clip(v_left_norm, -1.0, 1.0)) * self.dynamics.max_drive_force
+        F_drive_right = float(np.clip(v_right_norm, -1.0, 1.0)) * self.dynamics.max_drive_force
+        F_total_drive = F_drive_left + F_drive_right
+
+        # 2. 计算环境阻力
+        slope_rad = self.get_slope_at(x_prev, y_prev, observation)
+        normal_force = self.dynamics.total_weight * math.cos(slope_rad)
+        
+        F_slope = self.dynamics.total_weight * math.sin(slope_rad)
+        F_rolling = self.dynamics.coeff_rolling * normal_force
+        F_drag = self.dynamics.coeff_drag * v_prev * v_prev
+        F_resist_total = F_slope + F_rolling + F_drag
+
+        # 3. 计算转向力矩和阻力矩
+        M_drive = (F_drive_right - F_drive_left) * (self.dynamics.track_width_B / 2.0)
+        M_turn_resist = self.dynamics.coeff_turning * abs(omega_prev) * np.sign(omega_prev)
+
+        # 4. 牛顿-欧拉方程求解加速度
+        F_net = F_total_drive - F_resist_total
+        M_net = M_drive - M_turn_resist
+        
+        acc_linear = F_net / self.dynamics.mass
+        acc_angular = M_net / self.dynamics.inertia
+
+        # 5. 欧拉法数值积分更新状态
+        v_new = v_prev + acc_linear * dt
+        v_new = max(0.0, v_new) # 履带车速度不为负
+
+        omega_new = omega_prev + acc_angular * dt
+        yaw_new = (yaw_prev + omega_new * dt + 2 * math.pi) % (2 * math.pi) # 归一化到 [0, 2pi)
+        
+        x_new = x_prev + v_new * math.cos(yaw_new) * dt
+        y_new = y_prev + v_new * math.sin(yaw_new) * dt
+        
+        return {
+            'x': x_new, 'y': y_new, 'yaw_rad': yaw_new, 'v_mps': v_new,
+            'acc_mpss': acc_linear, 'yawrate_radps': omega_new,
+        }
+    
+    # --- 以下为原有函数的适配性修改和保留 ---
+
+    def step(self, action: tuple, old_observation: Observation, collision_lookup: CollisionLookup) -> Observation:
+        action = self._action_cheaker(action)
+        new_observation = self._update_ego_and_t(action, old_observation)
+        new_observation = self._update_other_vehicles_to_t(new_observation)
+        new_observation = self._update_end_status(new_observation)
+        return new_observation
+
+    def _action_cheaker(self, action):
+        if isinstance(action, (list, tuple)) and len(action) == 2:
+            return float(np.clip(action[0], -1.0, 1.0)), float(np.clip(action[1], -1.0, 1.0))
+        # 兼容旧接口
+        return np.clip(action[0], -15, 15), np.clip(action[1], -1, 1)
+
+    def _get_initial_observation(self) -> Observation:
+        observation = Observation()
+        observation.vehicle_info["ego"] = self.control_info.ego_info
+        observation = self._update_other_vehicles_to_t(observation)
+        observation.hdmaps = self.control_info.hdmaps
+        observation.test_setting = self.control_info.test_setting
+        observation = self._update_end_status(observation)
+        return observation
+
+    def _update_ego_and_t(self, action: tuple, old_observation: Observation) -> Observation:
+        new_observation = copy.copy(old_observation)
+        dt = old_observation.test_setting['dt']
+        new_observation.test_setting['t'] = float(old_observation.test_setting['t'] + dt)
+        
+        # 【调用新的动力学模型】
+        new_kinematics = self._update_state_dynamic(
+            old_observation.vehicle_info['ego'], action, dt, old_observation
+        )
+        # 更新ego车辆状态，同时保留shape等其他信息
+        new_observation.vehicle_info['ego'].update(new_kinematics)
+        return new_observation
+
+    def _update_other_vehicles_to_t(self, old_observation: Observation) -> Observation:
+        new_observation = copy.copy(old_observation)
+        new_observation.vehicle_info = {'ego': old_observation.vehicle_info['ego']}
+        t_str = str(np.around(old_observation.test_setting['t'], 3))
+
+        for veh_id, info in self.control_info.vehicle_traj.items():
+            if t_str in info:
+                new_observation.vehicle_info[veh_id] = info[t_str]
+                new_observation.vehicle_info[veh_id]['shape'] = info['shape']
+        return new_observation
+    
+    def _update_end_status(self, observation: Observation) -> Observation:
+        status_list = [-1]
+        if self._collision_detect(observation): status_list.append(2)
+        if observation.test_setting['t'] >= self.control_info.test_setting['max_t']: status_list.append(1)
+        if self.collision_lookup.collisionDetection(
+            observation.vehicle_info['ego']['x'] - observation.hdmaps['image_mask'].bitmap_local_info['utm_local_range'][0],
+            observation.vehicle_info['ego']['y'] - observation.hdmaps['image_mask'].bitmap_local_info['utm_local_range'][1],
+            observation.vehicle_info['ego']['yaw_rad'],
+            observation.hdmaps['image_mask'].image_ndarray): status_list.append(3)
+        if utils.is_inside_polygon(
+            observation.vehicle_info['ego']['x'],
+            observation.vehicle_info['ego']['y'],
+            observation.test_setting['goal']): status_list.append(4)
+        observation.test_setting['end'] = max(status_list)
+        return observation
+
+    def _collision_detect(self, observation: Observation) -> bool:
+        vehicles = list(observation.vehicle_info.items())
+        if len(vehicles) < 2: return False
+        
+        polygons = {vid: self._get_poly(vinfo) for vid, vinfo in vehicles}
+        ego_poly = polygons.get('ego')
+        if not ego_poly: return False
+
+        for vid, poly in polygons.items():
+            if vid != 'ego' and ego_poly.intersects(poly):
+                return True
+        return False
+
+    def _get_poly(self, vehicle: dict) -> Polygon:
+        corners = utils.calculate_vehicle_corners(
+            vehicle['shape']['length'], vehicle['shape']['width'],
+            vehicle['shape']['locationPoint2Head'], vehicle['shape']['locationPoint2Rear'],
+            vehicle['x'], vehicle['y'], vehicle['yaw_rad'])
+        return Polygon(corners)
+
+# 以下为文件中原有的 ReplayInfo, ReplayParser, Controller 类，保持不变
+class ReplayInfo:
+    def __init__(self): self.vehicle_traj = {}; self.ego_info = {"shape": {"vehicle_type": "MineTruck_NTE200", "length": 13.4, "width": 6.7, "height": 6.9, "min_turn_radius": 14.2, "locationPoint2Head": 2.708, "locationPoint2Rear": 2.708}, "x": 0, "y": 0, "v_mps": 0, "acc_mpss": 0, "yaw_rad": 0, "yawrate_radps": 0}; self.hdmaps = {}; self.test_setting = {"t": 0, "dt": 0.1, "max_t": 10, "goal": {"x": [1, 2, 3, 4], "y": [1, 2, 3, 4]}, "end": -1, "scenario_name": None, "scenario_type": None, "x_min": None, "x_max": None, "y_min": None, "y_max": None, "start_ego_info": None}
+    def _add_vehicle_shape(self, id: int, traj_info: dict = None):
+        if id not in self.vehicle_traj: self.vehicle_traj[id] = {}; self.vehicle_traj[id]['shape'] = traj_info['VehicleShapeInfo']
+    def _add_vehicle_traj(self, id: int, traj_info: dict = None):
+        for index, _ in enumerate(traj_info['states']['x']):
+            t = traj_info['StartTimeInScene'] + index * self.test_setting['dt']; str_t = str(round(float(t), 2))
+            if str_t not in self.vehicle_traj[id]: self.vehicle_traj[id][str_t] = {}
+            for key, value in zip(['x', 'y', 'yaw_rad', 'v_mps', 'yawrate_radps', 'acc_mpss'], [traj_info['states']['x'][index][0], traj_info['states']['y'][index][0], traj_info['states']['yaw_rad'][index][0], traj_info['states']['v_mps'][index][0], traj_info['states']['yawrate_radps'][index][0], traj_info['states']['acc_mpss'][index][0]]):
+                if value is not None: self.vehicle_traj[id][str_t][key] = (np.around(value, 5))
+    def _add_settings(self, scenario_name=None, scenario_type=None):
+        if scenario_name: self.test_setting['scenario_name'] = scenario_name
+        if scenario_type: self.test_setting['scenario_type'] = scenario_type
+    def _init_vehicle_ego_info(self, one_scenario: dict = None): self.ego_info.update({'shape': one_scenario['ego_info']['VehicleShapeInfo'], **one_scenario['ego_info']['start_states']})
+    def _get_dt_maxt(self, one_scenario: dict = None): self.test_setting.update({k: one_scenario[k] for k in ['max_t', 'dt', 'x_min', 'x_max', 'y_min', 'y_max']})
+
+class ReplayParser:
+    def __init__(self): self.replay_info = ReplayInfo()
+    def parse(self, scenario: dict) -> ReplayInfo: self.replay_info._add_settings(scenario['data']['scene_name'], scenario['test_settings']['mode']); self._parse_scenario(scenario['data']['dir_scene_file']); self._parse_hdmaps(scenario); return self.replay_info
+    def _parse_scenario(self, dir_scene_file: str):
+        with open(dir_scene_file, 'r') as f: one_scenario = json.load(f)
+        self.replay_info.test_setting['goal'] = one_scenario['goal']; self.replay_info._get_dt_maxt(one_scenario); self.replay_info._init_vehicle_ego_info(one_scenario)
+        for idx, traj_segment in enumerate(one_scenario['TrajSegmentInfo']): self.replay_info._add_vehicle_shape(idx + 1, traj_segment); self.replay_info._add_vehicle_traj(idx + 1, traj_segment)
+    def _parse_hdmaps(self, scenario: dict):
+        dataroot, location = scenario['file_info']['dir_maps'], scenario['file_info']['location']
+        self.replay_info.hdmaps['image_mask'] = BitMap(dataroot, location, 'bitmap_mask')
+        x_coords = [self.replay_info.ego_info['x']] + self.replay_info.test_setting['goal']['x'] + [self.replay_info.test_setting['x_min'], self.replay_info.test_setting['x_max']]
+        y_coords = [self.replay_info.ego_info['y']] + self.replay_info.test_setting['goal']['y'] + [self.replay_info.test_setting['y_min'], self.replay_info.test_setting['y_max']]
+        x_min, x_max, y_min, y_max = min(x_coords), max(x_coords), min(y_coords), max(y_coords); max_range = max(x_max - x_min, y_max - y_min); x_center, y_center = (x_min + x_max) / 2, (y_min + y_max) / 2
+        utm_range = (x_center - max_range / 2, y_center - max_range / 2, x_center + max_range / 2, y_center + max_range / 2)
+        self.replay_info.hdmaps['image_mask'].load_bitmap_using_utm_local_range(utm_range, 20, 20)
+        self.replay_info.hdmaps['tgsc_map'] = TgScenesMap(dataroot, location)
+
+class Controller:
+    def __init__(self) -> None: self.observation = Observation(); self.parser = ReplayParser(); self.controller = ReplayController()
+    def init(self, scenario: dict, collision_lookup: CollisionLookup) -> Tuple: self.control_info = self.parser.parse(scenario); self.observation = self.controller.init(self.control_info, collision_lookup); self.traj = self.control_info.vehicle_traj; return self.observation, self.traj
+    def step(self, action, collision_lookup: CollisionLookup): self.observation = self.controller.step(action, self.observation, collision_lookup); return self.observation
+# 内置库 
+import math
+import os
+import sys
+import copy
+from itertools import combinations
 from typing import Tuple
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),'..')) )

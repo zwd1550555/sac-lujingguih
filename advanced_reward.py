@@ -94,88 +94,55 @@ class ComfortabilityAnalyzer:
 
 class EnergyEfficiencyAnalyzer:
     """
-    能效分析器
+    【优化后】能效分析器：利用动力学模型参数计算更真实的能耗
     """
-    
     def __init__(self, efficiency_window_size: int = 20):
         self.efficiency_window_size = efficiency_window_size
-        self.speed_difference_history = deque(maxlen=efficiency_window_size)
         self.energy_consumption_history = deque(maxlen=efficiency_window_size)
-        
-    def calculate_speed_difference(self, v_left: float, v_right: float) -> float:
+        self.last_power_W = 0.0
+
+    def calculate_energy_consumption(self, ego_state: Dict, dynamics, dt: float) -> float:
         """
-        计算履带速度差
-        
+        根据物理模型计算瞬时功耗并估算能耗。
+
         Args:
-            v_left: 左履带速度
-            v_right: 右履带速度
-            
+            ego_state (Dict): 主车当前状态 (包含 v_mps, acc_mpss)
+            dynamics: 车辆动力学参数对象（VehicleDynamics）
+            dt (float): 时间步长
+
         Returns:
-            speed_diff: 速度差
+            float: 当前时间步的估算能耗 (焦耳)
         """
-        speed_diff = abs(v_left - v_right)
-        self.speed_difference_history.append(speed_diff)
-        return speed_diff
-    
-    def calculate_energy_consumption(self, v_left: float, v_right: float, 
-                                   acceleration: float) -> float:
-        """
-        计算能耗
-        
-        Args:
-            v_left: 左履带速度
-            v_right: 右履带速度
-            acceleration: 加速度
-            
-        Returns:
-            energy_consumption: 能耗
-        """
-        # 简化的能耗模型
-        # 能耗与速度平方和加速度成正比
-        avg_speed = (v_left + v_right) / 2
-        speed_energy = avg_speed ** 2
-        acceleration_energy = abs(acceleration) * 2
-        
-        # 原地转向能耗
-        speed_diff = abs(v_left - v_right)
-        turning_energy = speed_diff * 3
-        
-        total_energy = speed_energy + acceleration_energy + turning_energy
-        self.energy_consumption_history.append(total_energy)
-        
-        return total_energy
-    
+        v = float(ego_state.get('v_mps', 0.0))
+        acc = float(ego_state.get('acc_mpss', 0.0))
+
+        # 驱动功率：P_drive = (m*a) * v
+        F_net = dynamics.mass * acc
+        P_drive = F_net * v
+
+        # 阻力功率：P_resist = (F_rolling + F_drag) * v
+        F_rolling = dynamics.coeff_rolling * dynamics.total_weight
+        F_drag = dynamics.coeff_drag * v * v
+        P_resist = (F_rolling + F_drag) * v
+
+        # 仅计正功率消耗
+        P_total = max(0.0, P_resist) + max(0.0, P_drive)
+        energy_consumption_J = ((self.last_power_W + P_total) / 2.0) * dt
+        self.last_power_W = P_total
+        self.energy_consumption_history.append(energy_consumption_J)
+        return energy_consumption_J
+
     def get_efficiency_score(self) -> float:
-        """
-        获取能效分数
-        
-        Returns:
-            efficiency_score: 能效分数 (0-1)
-        """
         if not self.energy_consumption_history:
             return 1.0
-        
-        # 基于能耗的能效评估
-        avg_energy = np.mean(self.energy_consumption_history)
-        max_energy = np.max(self.energy_consumption_history)
-        
-        # 能效分数：能耗越低，分数越高
-        efficiency_score = max(0.0, 1.0 - (avg_energy / 50.0))  # 50.0为基准能耗
-        
-        return efficiency_score
-    
+        avg_energy_kJ = float(np.mean(self.energy_consumption_history)) / 1000.0
+        return max(0.0, 1.0 - (avg_energy_kJ / 50.0))
+
     def get_energy_penalty(self) -> float:
-        """
-        获取能耗惩罚
-        
-        Returns:
-            energy_penalty: 能耗惩罚值
-        """
         if not self.energy_consumption_history:
             return 0.0
-        
-        avg_energy = np.mean(self.energy_consumption_history)
-        return max(0.0, avg_energy - 30.0)  # 30.0为基准能耗
+        avg_energy_kJ = float(np.mean(self.energy_consumption_history)) / 1000.0
+        return max(0.0, avg_energy_kJ - 30.0)
 
 
 class AdvancedRewardCalculator:
@@ -247,9 +214,16 @@ class AdvancedRewardCalculator:
         jerk_penalty = self.comfort_analyzer.get_jerk_penalty()
         comfort_reward = comfort_score * 10.0 - jerk_penalty * self.jerk_penalty_weight
         
-        # 2. 能效奖励
-        speed_diff = self.energy_analyzer.calculate_speed_difference(v_left, v_right)
-        energy_consumption = self.energy_analyzer.calculate_energy_consumption(v_left, v_right, acceleration)
+        # 2. 能效奖励（使用物理动力学模型估算能耗）
+        try:
+            dynamics = curr_obs.get('env_dynamics', None)
+        except Exception:
+            dynamics = None
+        if dynamics is not None:
+            ego_curr_full = {'v_mps': float(ego_curr['v_mps']), 'acc_mpss': acceleration}
+            energy_consumption = self.energy_analyzer.calculate_energy_consumption(ego_curr_full, dynamics, dt)
+        else:
+            energy_consumption = 0.0
         efficiency_score = self.energy_analyzer.get_efficiency_score()
         energy_penalty = self.energy_analyzer.get_energy_penalty()
         efficiency_reward = efficiency_score * 5.0 - energy_penalty * self.energy_penalty_weight
@@ -276,7 +250,6 @@ class AdvancedRewardCalculator:
             'comfort_score': comfort_score,
             'efficiency_score': efficiency_score,
             'jerk': jerk,
-            'speed_difference': speed_diff,
             'energy_consumption': energy_consumption
         }
         
